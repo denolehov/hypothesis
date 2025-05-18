@@ -19,7 +19,7 @@ import collections
 import inspect
 from collections.abc import Iterable, Sequence
 from copy import copy
-from functools import lru_cache
+from functools import lru_cache, wraps
 from io import StringIO
 from time import perf_counter
 from typing import Any, Callable, ClassVar, Optional, TypeVar, Union, overload
@@ -201,7 +201,7 @@ def get_state_machine_test(state_machine_factory, *, settings=None, _min_steps=0
                     label = f"execute:rule:{rule.function.__name__}"
                     start = perf_counter()
                     start_gc = gc_cumulative_time()
-                    result = rule.function(machine, **data)
+                    result = machine._execute_fn(rule.function, **data)
                     in_gctime = gc_cumulative_time() - start_gc
                     cd._stateful_run_times[label] += perf_counter() - start - in_gctime
 
@@ -307,6 +307,9 @@ class RuleBasedStateMachine(metaclass=StateMachineMeta):
                 f"Assign to {tname}.TestCase.settings, or use @{descr} as a decorator "
                 f"on the {tname} class."
             )
+
+    def _execute_fn(self, fn, **data):
+        return fn(self, **data)
 
     def _pretty_print(self, value):
         if isinstance(value, VarReference):
@@ -446,7 +449,7 @@ class RuleBasedStateMachine(metaclass=StateMachineMeta):
             ):
                 output(f"state.{name}()")
             start = perf_counter()
-            result = invar.function(self)
+            result = self._execute_fn(invar.function)
             runtimes[f"execute:invariant:{name}"] += perf_counter() - start
             if result is not None:
                 fail_health_check(
@@ -862,9 +865,8 @@ def initialize(
             preconditions=preconditions,
         )
 
-        @proxies(f)
-        def rule_wrapper(*args, **kwargs):
-            return f(*args, **kwargs)
+
+        rule_wrapper = _smart_wrap(f)
 
         setattr(rule_wrapper, INITIALIZE_RULE_MARKER, rule)
         return rule_wrapper
@@ -875,6 +877,21 @@ def initialize(
 @attr.s()
 class VarReference:
     name = attr.ib()
+
+
+def _smart_wrap(func):
+    if inspect.iscoroutinefunction(func):
+        @wraps(func)
+        async def async_rule_wrapper(*args, **kwargs):
+            return await func(*args, **kwargs)
+
+        return async_rule_wrapper
+
+    @proxies(func)
+    def sync_rule_wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+
+    return sync_rule_wrapper
 
 
 # There are multiple alternatives for annotating the `precond` type, all of them
@@ -903,9 +920,7 @@ def precondition(precond: Callable[[Any], bool]) -> Callable[[TestFunc], TestFun
     """
 
     def decorator(f):
-        @proxies(f)
-        def precondition_wrapper(*args, **kwargs):
-            return f(*args, **kwargs)
+        precondition_wrapper = _smart_wrap(f)
 
         existing_initialize_rule = getattr(f, INITIALIZE_RULE_MARKER, None)
         if existing_initialize_rule is not None:
@@ -984,9 +999,7 @@ def invariant(*, check_during_init: bool = False) -> Callable[[TestFunc], TestFu
             check_during_init=check_during_init,
         )
 
-        @proxies(f)
-        def invariant_wrapper(*args, **kwargs):
-            return f(*args, **kwargs)
+        invariant_wrapper = _smart_wrap(f)
 
         setattr(invariant_wrapper, INVARIANT_MARKER, invar)
         return invariant_wrapper
